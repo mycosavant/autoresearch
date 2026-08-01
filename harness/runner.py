@@ -278,6 +278,13 @@ def report(
     if predicted > 0:
         print(f"predicted_xrt:    {1e6 / 48000.0 / predicted:.2f}")
     print(f"params:           {cost.params}")
+    # Provenance: which module the cost figure came from. A recurrent model is costed
+    # on its verified streaming form rather than on the scan it was trained through,
+    # and a reader comparing rows needs to see that rather than infer it.
+    if cost.used_streaming_form:
+        print(f"cost_form:        streaming (equiv esr {cost.equivalence_esr:.2e})")
+    else:
+        print("cost_form:        as trained")
     print(f"rtf:              {'n/a' if rtf is None else f'{rtf:.4f}'}")
     print(f"training_seconds: {training_seconds:.1f}")
     print(f"status:           {status}")

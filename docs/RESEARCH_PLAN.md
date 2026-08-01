@@ -89,6 +89,12 @@ These matter more here than in the LLM loop, because the cost axis is analytic a
    it before `keep`. Without this the agent banks noise for 50 iterations and drifts.
 5. Perceptual guard: track rank correlation between the ESR ordering and the MRSTFT ordering across
    the run log. Sustained divergence means ESR is being gamed and gets surfaced, not silently kept.
+6. **Streaming-form verification** (`harness/streaming.py`). Recurrent architectures have to be
+   costed on something other than what they trained through, which is a hole in the cap by
+   construction. A `streaming_form()` is believed only after it matches the training form to better
+   than 1e-6 ESR, adds no parameters, and survives an extrapolation of its short-probe cost fit
+   against a real measurement at the reference length. Failing any check raises rather than falling
+   back — a fallback would log "too expensive" where the truth is "unverifiable".
 
 ### Baselines before novelty
 

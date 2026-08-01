@@ -55,6 +55,34 @@ compute cap**.
   (attention over an uncached growing context), it is flagged `is_linear=False` and
   cannot be fairly compared — you will need to give it a bounded-cost streaming form.
 
+### When you are not trained the way you deploy
+
+Recurrences are the exception to "cost what you run". A state-space layer costs O(1)
+per sample when deployed, but you cannot train it that way — a sample-at-a-time loop
+over 48 kHz audio is unusably slow — so you train it through a chunked scan or an FFT
+convolution that does O(chunk) work per sample. Costing the training form would
+report a number one to two orders of magnitude above the deployed cost and reject the
+architecture for how you trained it rather than for what it is.
+
+So a model may define **`streaming_form() -> nn.Module`**, and cost is then measured
+on that instead. It has to earn it. Before a single op is counted, `harness/streaming.py`:
+
+1. Runs both forms on the same random signal and requires them to agree to better
+   than `1e-6` ESR. That is four orders below any ESR a converged model reaches, so
+   the two forms provably cannot differ by enough to move a result.
+2. Refuses a streaming form with more parameters than the training form.
+3. Fits cost over a short probe, **extrapolates to the reference length, and checks
+   it against a real measurement there** — so a model that is affine over the probe
+   window and expensive beyond it is caught rather than believed.
+
+Any of those failing is an error, not a fallback: a silent fallback to costing the
+training form would print "too expensive" when the truth is "unverifiable", and those
+are very different things to have in the run log. When a streaming form *is* used the
+run prints `cost_form: streaming (equiv esr ...)` so the provenance is on the record.
+
+Cost verification costs about 30 s of the run. That is the price of the extrapolation
+check, and it is not optional.
+
 **Panel, not single capture.** Every model is trained on 4 captures (clean / crunch /
 high-gain / pedal) and scored on the mean. A win on one amp that loses on the others
 is not a win. Scoring a single capture would overfit the *architecture* to one amp's
@@ -183,6 +211,17 @@ opportunity.
   gives unbounded receptive field at O(1) per sample. Arguably the most natural fit
   for amp modeling and badly under-explored here. Note the cost counter measures
   streaming slope, so a properly-formulated recurrence is scored fairly.
+
+  **There is a worked example of this already in `train.py`**: `wh_ssm`, a
+  Wiener–Hammerstein cascade (`filter → nonlinearity → filter → nonlinearity →
+  filter`) whose linear blocks are banks of learned damped rotations — conjugate pole
+  pairs, i.e. second-order sections. It measures **10,160 MACs/sample, 441
+  elementwise, 10,161 params**: 86% of A2's MAC cap and 60% of its elementwise
+  budget, with unbounded rather than 132 ms memory. It is a *starting point, not a
+  result* — nobody has trained it yet, and the ESR could be terrible. Read it for the
+  two-form pattern and the traps (gain must be decoupled from pole radius, and
+  `sigmoid` alone does not keep a pole off the unit circle in float32), then attack
+  the structure.
 - **Explicit Wiener–Hammerstein blocks** as an architectural prior, rather than
   making a generic stack rediscover the structure from data.
 
