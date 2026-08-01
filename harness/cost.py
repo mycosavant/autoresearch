@@ -42,6 +42,15 @@ exactly the streaming per-sample cost, with edge effects falling out as the
 intercept. Sampling a third point also tests linearity: an architecture whose cost
 grows superlinearly (attention over an uncached, growing context) is detected and
 flagged rather than silently reported at one arbitrary length.
+
+Models that are not trained the way they are deployed
+-----------------------------------------------------
+Recurrent and state-space architectures do the same arithmetic per sample when
+deployed but are trained through a scan or an FFT convolution, so costing the
+training form would report something one to two orders of magnitude off. Such a model
+may expose ``streaming_form()``; cost is then measured on that module, but only after
+:mod:`harness.streaming` has verified it is the same function with no added capacity.
+See that module for the checks and for the residual risk they do not close.
 """
 
 from __future__ import annotations
@@ -52,6 +61,8 @@ from typing import Any, Callable, Dict, Sequence, Set
 
 import torch as _torch
 from torch.utils._python_dispatch import TorchDispatchMode as _TorchDispatchMode
+
+from harness import streaming as _streaming
 
 __all__ = [
     "CostReport",
@@ -98,6 +109,13 @@ class CostReport:
     #: REFERENCE_CONTEXT_SAMPLES and must not be compared against fixed-cost models.
     is_linear: bool = True
     nonlinearity: float = 0.0
+    #: True when cost was measured on a verified ``streaming_form()`` rather than on
+    #: the model as trained. Surfaced rather than silent: a result whose cost figure
+    #: came from a different module than the one that produced the ESR is a result
+    #: whose provenance a reader needs to know.
+    used_streaming_form: bool = False
+    #: Measured disagreement between the training and streaming forms, in ESR.
+    equivalence_esr: float = 0.0
 
     def as_row(self) -> Dict[str, Any]:
         return {
@@ -295,6 +313,42 @@ def _measure(model, length: int, batch_size: int, device: str, make_inputs) -> t
     return mode.macs, mode.elementwise, mode.op_counts, int(out_tensor.shape[-1]) * batch_size
 
 
+def _verify_extrapolation(
+    module,
+    *,
+    probe,
+    slope: float,
+    at_length: int,
+    batch_size: int,
+    device: str,
+    make_inputs,
+    measured_macs: Sequence[int],
+) -> None:
+    """Confirm a short-probe fit still describes cost at the reference length.
+
+    A streaming form is probed over a few hundred samples because a per-sample
+    recurrence under the dispatch counter is slow. That is sound only if cost is
+    affine in length everywhere, not merely across the probe window -- a model doing
+    extra work past some threshold would be affine locally and cheap-looking globally.
+    One measurement at the reference length settles it.
+    """
+    if at_length <= probe.lengths()[-1]:
+        return  # Probe already spans the reference length; nothing to extrapolate.
+
+    intercept = measured_macs[0] - slope * probe.base
+    predicted = slope * at_length + intercept
+    actual, _, _, _ = _measure(module, at_length, batch_size, device, make_inputs)
+
+    scale = max(abs(predicted), 1.0)
+    if abs(actual - predicted) / scale > _streaming.EXTRAPOLATION_RTOL:
+        raise _streaming.StreamingFormError(
+            f"Streaming cost is not affine in input length: the fit over "
+            f"{probe.lengths()} predicts {predicted:.1f} MACs at {at_length} samples, "
+            f"but {actual} were counted. Per-sample cost that depends on how much "
+            f"context has accumulated cannot be compared against fixed-cost models."
+        )
+
+
 def count_cost(
     model: _torch.nn.Module,
     input_samples: int = REFERENCE_CONTEXT_SAMPLES,
@@ -302,6 +356,7 @@ def count_cost(
     batch_size: int = 1,
     device: str = "cpu",
     make_inputs: Callable[[int, int], Sequence[_torch.Tensor]] | None = None,
+    verify_at: int | None = None,
 ) -> CostReport:
     """Measure streaming per-output-sample compute cost of ``model``.
 
@@ -313,14 +368,24 @@ def count_cost(
     :param input_samples: Base probe length. Must exceed the model's receptive field.
     :param make_inputs: Optional factory ``(batch_size, length) -> args`` for models
         whose signature is not ``(x,)``.
+    :param verify_at: Length at which a streaming form's extrapolated cost is checked
+        against a real measurement. Defaults to ``REFERENCE_CONTEXT_SAMPLES``; tests
+        may lower it. Ignored when no streaming form is used.
     :raises UnregisteredOpError: if any op ran without a cost rule.
+    :raises harness.streaming.StreamingFormError: if a streaming form fails its checks.
     """
     model = model.to(device).eval()
 
-    lengths = [input_samples, input_samples + _PROBE_STRIDE, input_samples + 2 * _PROBE_STRIDE]
+    resolved = _streaming.resolve(
+        model, device=device, default_base=input_samples, default_stride=_PROBE_STRIDE
+    )
+    measured = resolved.module
+    probe = resolved.probe or _streaming.ProbeSpec(base=input_samples, stride=_PROBE_STRIDE)
+    lengths = probe.lengths()
+
     macs, elementwise, counts, out_samples = [], [], None, None
     for L in lengths:
-        m, e, c, n = _measure(model, L, batch_size, device, make_inputs)
+        m, e, c, n = _measure(measured, L, batch_size, device, make_inputs)
         macs.append(m)
         elementwise.append(e)
         if counts is None:
@@ -330,10 +395,22 @@ def count_cost(
         raise ValueError("Model produced no output samples; is the probe shorter than its receptive field?")
 
     per_sample = lambda ys: [  # noqa: E731
-        (ys[i + 1] - ys[i]) / (_PROBE_STRIDE * batch_size) for i in range(len(ys) - 1)
+        (ys[i + 1] - ys[i]) / (probe.stride * batch_size) for i in range(len(ys) - 1)
     ]
     mac_slopes = per_sample(macs)
     ew_slopes = per_sample(elementwise)
+
+    if resolved.used_streaming:
+        _verify_extrapolation(
+            measured,
+            probe=probe,
+            slope=mac_slopes[-1] * batch_size,
+            at_length=REFERENCE_CONTEXT_SAMPLES if verify_at is None else verify_at,
+            batch_size=batch_size,
+            device=device,
+            make_inputs=make_inputs,
+            measured_macs=macs,
+        )
 
     # Linearity: equal successive slopes means constant per-sample cost.
     scale = max(abs(mac_slopes[0]), 1.0)
@@ -350,4 +427,6 @@ def count_cost(
         op_counts=dict(counts or {}),
         is_linear=is_linear,
         nonlinearity=nonlinearity,
+        used_streaming_form=resolved.used_streaming,
+        equivalence_esr=resolved.equivalence_esr,
     )
