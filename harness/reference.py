@@ -8,13 +8,26 @@ way for the cap to silently drift out of sync with what it claims to represent.
 
 Provenance
 ----------
-Reconstructed from the C++ fast path's detector, which is the only authoritative A2
-definition that exists in either repo:
-``NeuralAmpModelerCore/NAM/wavenet/a2_fast.{h,cpp}``. Note that there is **no
-shipped A2 .nam file** -- ``example_models/wavenet_a2_max.nam`` is a feature-coverage
-stress model for the v0.6.0 schema, not an A2 model, and ``is_a2_shape()`` rejects
-it. There is also no A2 preset in the Python trainer (``nam/train/core.py`` carries
-only the A1 family; its ``Architecture.NANO`` is *A1* nano and is unrelated).
+Reconstructed from the C++ fast path's detector
+(``NeuralAmpModelerCore/NAM/wavenet/a2_fast.{h,cpp}``), then **validated against a
+real deployed A2 model**: ``BossWN-a2.nam`` from ``mikeoliphant/NeuralAudio`` (MIT),
+vendored as a modulus parity fixture and byte-verified against the public upstream
+blob. See ``tests/test_real_a2_model.py``.
+
+Neither local repo ships an A2 model -- ``example_models/wavenet_a2_max.nam`` is a
+v0.6.0 feature-coverage stress fixture, not A2 -- and there is no A2 preset in the
+Python trainer (``nam/train/core.py`` carries only the A1 family; its
+``Architecture.NANO`` is *A1* nano). But deployed A2 models do exist publicly; the
+known corpus is just very small (n=1 found by modulus's survey, and that one a NAM
+developer's test vector, so selection bias is severe).
+
+**How A2 is actually trained**, which the detector cannot tell you: the default
+recipe (``nam/train/_resources/config_model_packed.json``) is a ``PackedWaveNet``
+carrying ``channels_3`` and ``channels_8`` trained *masked together*, then exported
+as a ``SlimmableContainer``. The baseline in ``train.py`` trains each width
+independently instead, which is a real divergence from how A2 was made -- joint
+training may help the small width or hurt the large one. Worth measuring before
+treating an independently-trained A2 as "the A2 number".
 
 Expected costs, cross-checked three ways -- against the C++ detector constants,
 against ``tools/test/test_a2_fast.cpp``'s independent weight counter, and by
@@ -84,15 +97,20 @@ _A2_HEAD_KERNEL_SIZE = 16
 #: folded back into the head scale at export. The validated real-world A2 model
 #: ``BossWN-a2.nam`` (mikeoliphant/NeuralAudio, MIT) carries 0.013119162069029721.
 #:
-#: That exposes a genuine inconsistency in the C++ fast path: ``is_a2_shape()``
-#: gates on the JSON ``head_scale`` being within 1e-7 of 0.01
-#: (``a2_fast.cpp:778-782``), but ``_load_weights`` then overrides ``_head_scale``
-#: from the trailing value in the weight stream anyway (``a2_fast.cpp:264-265``).
-#: So the field is load-bearing for *detection* while being ignored for *computation*
-#: -- and a real A2 model whose loudness normalization moved head_scale off 0.01 is
-#: silently rejected by the specialization built for it, falling back to the generic
-#: WaveNet with no warning. Verified against BossWN-a2; whether it holds across a
-#: corpus of A2 models has not been checked.
+#: 0.01 is the *trainer initialization* value (``config_model_packed.json``), which
+#: the export hook then overwrites. NAM's ``_ScaleOutputHook`` multiplies both
+#: ``config.head_scale`` and ``weights[-1]`` by the loudness scale, so a deployed
+#: model's head_scale is whatever normalization produced.
+#:
+#: **Version-specific trap.** The pinned ``NeuralAmpModelerCore`` checkout here
+#: (v0.5.1/v0.5.2) defines ``kHeadScale = 0.01f`` and has ``is_a2_shape()`` reject
+#: anything more than 1e-7 away from it (``a2_fast.cpp:778-782``) -- while
+#: ``_load_weights`` overrides ``_head_scale`` from the weight stream regardless
+#: (``a2_fast.cpp:264-265``). At that pin, the only known deployed A2 model is
+#: rejected by the specialization written for it and silently falls back to the
+#: generic WaveNet. **Upstream ``main`` has since removed ``kHeadScale`` entirely**;
+#: ``is_a2_shape`` now only checks that head_scale is present and numeric. So this is
+#: a stale-pin issue, not a live upstream bug -- worth pulling into the fork.
 _A2_HEAD_SCALE = 0.01
 
 _A2_LEAKY_SLOPE = 0.01

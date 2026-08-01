@@ -21,6 +21,7 @@ import torch as _torch
 
 from .constants import EXPERIMENT_SECONDS
 from .cost import CostReport, count_cost
+from .cost_model import DEFAULT_MODEL, features_of
 from .data import Capture, Panel
 from .metrics import CaptureMetrics, PanelMetrics, aggregate, evaluate_capture
 from .reference import a2_standard
@@ -228,7 +229,7 @@ def _reference_budget() -> Budget:
     Deliberately not cached to disk: there is then no artifact to edit, and the cap
     cannot drift out of sync with the architecture it claims to represent.
     """
-    return Budget.from_reference(count_cost(a2_standard(), device="cpu"))
+    return Budget.from_reference(count_cost(a2_standard(), device="cpu"), DEFAULT_MODEL)
 
 
 def report(
@@ -252,7 +253,7 @@ def report(
     budget = _reference_budget()
 
     status, note = "ok", ""
-    breach = check_budget(cost, budget)
+    breach = check_budget(cost, budget, DEFAULT_MODEL)
     if breach is not None:
         status, note = "invalid", breach
     elif not cost.is_linear:
@@ -271,6 +272,11 @@ def report(
     print(f"macs_per_sample:  {cost.macs_per_sample:.1f}")
     print(f"mac_budget:       {budget.macs_per_sample:.1f}")
     print(f"elementwise:      {cost.elementwise_per_sample:.1f}")
+    predicted = DEFAULT_MODEL.predict(features_of(cost))
+    gating = "gating" if budget.model_gates else "ADVISORY-uncalibrated"
+    print(f"predicted_us:     {predicted:.4f}  ({gating})")
+    if predicted > 0:
+        print(f"predicted_xrt:    {1e6 / 48000.0 / predicted:.2f}")
     print(f"params:           {cost.params}")
     print(f"rtf:              {'n/a' if rtf is None else f'{rtf:.4f}'}")
     print(f"training_seconds: {training_seconds:.1f}")

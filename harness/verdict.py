@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass as _dataclass
 from enum import Enum as _Enum
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from .constants import (
     ELEMENTWISE_BUDGET_FACTOR as _EW_FACTOR,
@@ -28,6 +28,9 @@ from .constants import (
     MAC_BUDGET_TOLERANCE as _MAC_TOL,
 )
 from .cost import CostReport
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .cost_model import CostModel
 
 __all__ = ["Verdict", "Budget", "Decision", "check_budget", "noise_floor", "decide"]
 
@@ -46,16 +49,35 @@ class Budget:
     Deliberately not loaded from a file: the cap is recomputed from
     ``harness/reference.py`` on every run, so there is no artifact to tamper with
     and no way for the cap to drift out of sync with what it claims to represent.
+
+    Two layers. The MAC and elementwise caps are cheap necessary conditions, always
+    enforced. The predicted-runtime cap is the one that actually reflects hardware --
+    but it only binds once the cost model is adequately calibrated, because gating on
+    an unidentified model would be worse than gating on raw MACs: it would be just as
+    wrong and harder to see through.
     """
 
     macs_per_sample: float
     elementwise_per_sample: float
+    predicted_us_per_sample: Optional[float] = None
+    model_gates: bool = False
 
     @classmethod
-    def from_reference(cls, report: CostReport) -> "Budget":
+    def from_reference(
+        cls, report: CostReport, cost_model: "CostModel | None" = None
+    ) -> "Budget":
+        predicted = None
+        gates = False
+        if cost_model is not None:
+            from .cost_model import features_of
+
+            predicted = cost_model.predict(features_of(report)) * (1.0 + _MAC_TOL)
+            gates = cost_model.is_adequate
         return cls(
             macs_per_sample=report.macs_per_sample * (1.0 + _MAC_TOL),
             elementwise_per_sample=report.elementwise_per_sample * _EW_FACTOR,
+            predicted_us_per_sample=predicted,
+            model_gates=gates,
         )
 
 
@@ -69,7 +91,9 @@ class Decision:
         return self.verdict is Verdict.KEEP
 
 
-def check_budget(report: CostReport, budget: Budget) -> Optional[str]:
+def check_budget(
+    report: CostReport, budget: Budget, cost_model: "CostModel | None" = None
+) -> Optional[str]:
     """Return a rejection reason if ``report`` breaches the cap, else ``None``."""
     if report.macs_per_sample > budget.macs_per_sample:
         over = report.macs_per_sample / budget.macs_per_sample - 1.0
@@ -84,6 +108,18 @@ def check_budget(report: CostReport, budget: Budget) -> Optional[str]:
             f"({report.elementwise_per_sample:.1f} > "
             f"{budget.elementwise_per_sample:.1f} ops/sample)"
         )
+
+    # Predicted runtime binds only once the model can carry the weight.
+    if budget.model_gates and cost_model is not None and budget.predicted_us_per_sample:
+        from .cost_model import features_of
+
+        predicted = cost_model.predict(features_of(report))
+        if predicted > budget.predicted_us_per_sample:
+            over = predicted / budget.predicted_us_per_sample - 1.0
+            return (
+                f"over predicted-runtime budget by {over:.1%} "
+                f"({predicted:.4f} > {budget.predicted_us_per_sample:.4f} us/sample)"
+            )
     return None
 
 
