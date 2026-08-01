@@ -53,8 +53,20 @@ MAX_DELAY_SEARCH = 4096
 #: poorly and give unstable estimates.
 DELAY_ESTIMATE_SECONDS = 20.0
 
-#: Peak level captures are normalized to, leaving headroom.
-TARGET_PEAK = 0.95
+#: Target RMS level in dBFS. NAM normalizes to a -18 dBFS reference, and A2
+#: additionally folds that rescale back into its head scale; the C++ loader applies
+#: ``gain = 10^((-18 - metadata.loudness) / 20)`` post-inference for both A1 and A2.
+#: Matching it here keeps this harness's data conditioning consistent with the
+#: models it is trying to beat. RMS rather than peak: a high-gain capture is heavily
+#: compressed, so peak-normalizing it lands the *body* of the signal far quieter than
+#: a clean capture normalized the same way, which would silently make the panel's
+#: categories operate at different points on their nonlinearities.
+TARGET_RMS_DBFS = -18.0
+
+#: Ceiling applied after RMS normalization. A -18 dBFS RMS crest can still exceed
+#: full scale on a clean capture, and clipping the reference signal would corrupt the
+#: target the model is being asked to fit.
+PEAK_CEILING = 0.99
 
 
 def _log(msg: str) -> None:
@@ -163,6 +175,19 @@ def _load_and_normalize(path: _Path) -> _np.ndarray:
     return x
 
 
+def _normalize_rms(z: _np.ndarray, target_dbfs: float = TARGET_RMS_DBFS) -> _np.ndarray:
+    """Scale ``z`` to ``target_dbfs`` RMS, backing off if that would clip."""
+    rms = float(_np.sqrt(_np.mean(_np.square(z.astype(_np.float64)))))
+    if rms == 0.0:
+        raise ValueError("Silent signal; cannot normalize.")
+
+    gain = 10.0 ** (target_dbfs / 20.0) / rms
+    peak = float(_np.abs(z).max()) * gain
+    if peak > PEAK_CEILING:
+        gain *= PEAK_CEILING / peak
+    return (z * gain).astype(_np.float32)
+
+
 def _prepare_entry(entry: Dict, out_dir: _Path) -> Dict:
     from nam.data import np_to_wav
 
@@ -180,11 +205,9 @@ def _prepare_entry(entry: Dict, out_dir: _Path) -> Dict:
     delay = estimate_delay(x, y)
     _log(f"    delay={delay} samples ({1000 * delay / SAMPLE_RATE:.2f} ms)")
 
-    # Normalize levels *after* alignment. Peak-normalizing is deliberate rather than
-    # RMS: ESR is energy-relative already, and a peak-normalized target keeps the
-    # nonlinearity operating at the level it was captured at.
-    x = x / _np.abs(x).max() * TARGET_PEAK
-    y = y / _np.abs(y).max() * TARGET_PEAK
+    # Normalize levels *after* alignment, to NAM's -18 dBFS RMS reference.
+    x = _normalize_rms(x)
+    y = _normalize_rms(y)
 
     np_to_wav(x, dest / "input.wav", rate=SAMPLE_RATE)
     np_to_wav(y, dest / "target.wav", rate=SAMPLE_RATE)

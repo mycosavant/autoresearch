@@ -20,8 +20,19 @@ sdatkinson's own Fender Deluxe Reverb A2 capture — but not for training.
 Slots 1–3 are the **exact captures from the Slimmable NAM paper** (arXiv 2511.07470),
 published via its companion repo
 [SlimmableNamTrain](https://github.com/Atkinson-Advanced-Modeling/SlimmableNamTrain)
-(MIT). This is what makes the A2 reproduction gate meaningful: the same audio, the
-same splits, and a published ESR curve to land on.
+(MIT). Real Atkinson captures with official splits — the best training data available.
+
+> **Correction: this is not an A2 benchmark.** An earlier version of this document
+> claimed these captures let us compare against published *A2* numbers. They do not.
+> **Slimmable and A2 are orthogonal axes** that merely co-launched under the same
+> banner: the C++ `is_a2_shape()` detector explicitly *rejects* any config carrying a
+> `slimmable` field, and the shipped `slimmable_wavenet.nam` is an **A1-shaped** net
+> (uniform `kernel_size: 3`, doubling dilations `1…512`, ReLU, `head_scale: 0.02`).
+> So arXiv 2511.07470's published ESR curve describes slimmable A1-family models, not
+> A2, and landing on it would prove nothing about A2.
+>
+> The captures remain the right choice. What we lose is a free external check on the
+> A2 baseline — see "The A2 reproduction gate" below.
 
 | Slot | Capture | Device | Source |
 |---|---|---|---|
@@ -50,6 +61,39 @@ Deliberately different amps, dry signals, guitars, and sample rates, so that
 - **EHX Big Muff** — Zenodo 10891515. Fuzz: topologically unlike anything in the
   panel, and a deliberately hard case.
 - **Omega Obsidian (lead)** — A2 paper set.
+
+## The A2 reproduction gate
+
+The plan called for validating the harness by training A2 standard and checking it
+lands within noise of its published ESR. **No such published per-capture ESR figure
+exists.** TONE3000's A2 evaluation covered 39 tones, but only the MUSHRA listener
+ratings were released — no per-tone ESR table, and no audio. And as above, the
+Slimmable paper's curve is not an A2 curve.
+
+So the gate has to be an *internal* consistency check instead:
+
+1. **A2 must beat A1 standard** on the same captures at lower compute (11,776 vs
+   13,321 MACs/sample). That is A2's whole claim; if the harness cannot reproduce a
+   result that lopsided, the harness is wrong.
+2. **A2 standard must beat A2 nano** by a clear margin (11,776 vs 1,731 MACs/sample).
+3. **Cost figures must match** the three independent derivations that already agree:
+   12,145 / 1,870 params and 11,776 / 1,731 MACs/sample.
+4. **ESR must be in a sane absolute range** for a converged amp model — order 1e-3 to
+   1e-2 on these captures, not 1e-1.
+
+Weaker than an external number, and worth being honest about: this checks the harness
+is self-consistent, not that it agrees with Atkinson's setup.
+
+## Normalization
+
+Captures are normalized to **−18 dBFS RMS**, matching NAM's reference level. The C++
+loader applies `gain = 10^((-18 - metadata.loudness) / 20)` post-inference for both A1
+and A2, and A2 additionally folds that rescale into its head scale.
+
+RMS rather than peak, deliberately: a high-gain capture is heavily compressed, so
+peak-normalizing lands the body of the signal far quieter than a clean capture
+normalized the same way — which would silently put the panel's four categories at
+different points on their nonlinearities and confound every comparison across them.
 
 ## Licensing — read this
 

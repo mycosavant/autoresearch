@@ -101,9 +101,15 @@ training box.
 ## Baselines first
 
 The loop establishes A2 standard, A2 nano, A1 standard, and the noise floor before
-inventing anything. **If harness-trained A2 standard does not land within noise of
-its published ESR on the same captures, the harness is wrong and no result from it
-means anything.** That check gates everything downstream.
+inventing anything.
+
+There is **no published per-capture A2 ESR figure to check against** — TONE3000
+released only MUSHRA listener ratings from its 39-tone evaluation, and the Slimmable
+NAM paper's curve describes slimmable A1-family models, not A2 (the two are orthogonal
+axes that co-launched). So the gate is internal consistency: A2 must beat A1 at lower
+compute, A2 standard must clearly beat A2 nano, cost figures must match the three
+independent derivations, and ESR must be in a sane absolute range. See `docs/DATA.md`.
+If those fail, the harness is wrong and no result from it means anything.
 
 ## A2 provenance
 
