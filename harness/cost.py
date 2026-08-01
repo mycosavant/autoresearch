@@ -162,7 +162,29 @@ def _sdpa_macs(args, out) -> int:
     return batch * lq * lk * (d_qk + d_v)
 
 
+def _mkldnn_rnn_macs(args, out) -> int:
+    # aten.mkldnn_rnn_layer(input, w_ih, w_hh, b_ih, b_hh, hx, cx, reverse,
+    #                       batch_sizes, mode, hidden_size, num_layers, ...)
+    # input is (seq, batch, input_size); w_ih is (gates*H, input_size);
+    # w_hh is (gates*H, H). Derived from shapes rather than from the gate count, so
+    # this stays correct for LSTM (4 gates) and GRU (3) alike.
+    inp, w_ih, w_hh = args[0], args[1], args[2]
+    steps = int(inp.shape[0]) * int(inp.shape[1])
+    return steps * (int(w_ih.numel()) + int(w_hh.numel()))
+
+
+def _cudnn_rnn_macs(args, out) -> int:
+    # aten._cudnn_rnn(input, weight[], weight_stride0, ...)
+    inp, weights = args[0], args[1]
+    steps = int(inp.shape[0]) * int(inp.shape[1])
+    # 2-D entries are the weight matrices; 1-D entries are biases (no MACs).
+    per_step = sum(int(w.numel()) for w in weights if w.dim() == 2)
+    return steps * per_step
+
+
 _MAC_RULES: Dict[str, Callable[[Any, Any], int]] = {
+    "mkldnn_rnn_layer": _mkldnn_rnn_macs,
+    "_cudnn_rnn": _cudnn_rnn_macs,
     "convolution": _convolution_macs,
     "_convolution": _convolution_macs,
     "conv1d": _convolution_macs,

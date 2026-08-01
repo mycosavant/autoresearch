@@ -17,9 +17,16 @@ blob. See ``tests/test_real_a2_model.py``.
 Neither local repo ships an A2 model -- ``example_models/wavenet_a2_max.nam`` is a
 v0.6.0 feature-coverage stress fixture, not A2 -- and there is no A2 preset in the
 Python trainer (``nam/train/core.py`` carries only the A1 family; its
-``Architecture.NANO`` is *A1* nano). But deployed A2 models do exist publicly; the
-known corpus is just very small (n=1 found by modulus's survey, and that one a NAM
-developer's test vector, so selection bias is severe).
+``Architecture.NANO`` is *A1* nano). But deployed A2 models do exist publicly.
+
+Do not read modulus's "n=1 deployed" figure as a fact about the world: that survey
+ran on 2026-06-06 when A2 was five weeks old, and it records that TONE3000 -- the
+dominant A2 distribution channel -- is OAuth/PKCE-gated and returned HTTP 401, so it
+could not be enumerated at all. n=1 is what was reachable without an account, not
+what exists. TONE3000 has since retrained much of its library to A2. The practical
+consequence is that **tail diversity is unknown**: whether deployed A2 ever activates
+FiLM, gating, or channel counts beyond 3 and 8 has never been established, only that
+the single reachable model did not.
 
 **How A2 is actually trained**, which the detector cannot tell you: the default
 recipe (``nam/train/_resources/config_model_packed.json``) is a ``PackedWaveNet``
@@ -64,9 +71,16 @@ __all__ = [
     "A2_STANDARD_PARAMS",
     "A2_NANO_PARAMS",
     "A2_RECEPTIVE_FIELD",
+    "A1_STANDARD_CONFIG",
+    "A1_STANDARD_PARAMS",
+    "A1_STANDARD_MACS",
+    "A1_RECEPTIVE_FIELD",
+    "LSTM_CONFIG",
     "build_reference",
     "a2_standard",
     "a2_nano",
+    "a1_standard",
+    "lstm_baseline",
 ]
 
 # --------------------------------------------------------------------------------
@@ -177,3 +191,67 @@ def a2_standard():
 def a2_nano():
     """The low-compute reference point."""
     return build_reference(A2_NANO_CONFIG)
+
+
+# --------------------------------------------------------------------------------
+# Prior-generation baselines, for context on how much A2 actually moved.
+#
+# A1 standard is transcribed from example_models/wavenet_a1_standard.nam, upgraded
+# to the current schema (that file uses the legacy head_size/head_bias pair, which
+# current NAM cannot load -- see harness/legacy.py). Verified on load: 13,801
+# parameters, receptive field 4,093, 13,320 MACs/sample.
+#
+# Note A1 uses head_scale 0.02 and Tanh, against A2's 0.01 and LeakyReLU, and reaches
+# a receptive field of only 4,093 against A2's 6,347 while costing *more*
+# (13,320 vs 11,776 MACs/sample). That gap is the thing this repo is trying to beat
+# again.
+# --------------------------------------------------------------------------------
+
+_A1_DILATIONS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+A1_STANDARD_CONFIG: Dict[str, Any] = {
+    "layers_configs": [
+        {
+            "input_size": 1,
+            "condition_size": 1,
+            "channels": 16,
+            "head": {"out_channels": 8, "kernel_size": 1, "bias": False},
+            "kernel_size": 3,
+            "dilations": list(_A1_DILATIONS),
+            "activation": "Tanh",
+        },
+        {
+            "input_size": 16,
+            "condition_size": 1,
+            "channels": 8,
+            "head": {"out_channels": 1, "kernel_size": 1, "bias": True},
+            "kernel_size": 3,
+            "dilations": list(_A1_DILATIONS),
+            "activation": "Tanh",
+        },
+    ],
+    "head": None,
+    "head_scale": 0.02,
+}
+
+A1_STANDARD_PARAMS = 13_801
+A1_STANDARD_MACS = 13_320
+A1_RECEPTIVE_FIELD = 4_093
+
+#: The LSTM baseline, from example_models/lstm.nam. Included because it is a
+#: structurally different answer to the same problem -- unbounded memory through
+#: recurrence rather than a finite dilated window -- and so is a useful sanity check
+#: that the harness is not silently specialized to convolutional models.
+LSTM_CONFIG: Dict[str, Any] = {"input_size": 1, "hidden_size": 3, "num_layers": 1}
+
+
+def a1_standard():
+    """Previous-generation reference. Costs more than A2 for less receptive field."""
+    return build_reference(A1_STANDARD_CONFIG)
+
+
+def lstm_baseline():
+    """Recurrent baseline."""
+    from nam.models.recurrent import LSTM
+
+    return LSTM(**_copy.deepcopy(LSTM_CONFIG))

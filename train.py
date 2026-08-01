@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from harness.constants import EXPERIMENT_SECONDS, PRE_EMPH_COEF
 from harness.data import load_panel
-from harness.reference import a2_standard
+from harness.reference import a1_standard, a2_nano, a2_standard, lstm_baseline
 from harness.runner import TimeBudget, report, valid_forward
 
 # ================================================================================
@@ -42,19 +42,42 @@ LR_STEP_EVERY = 100       # optimizer steps between scheduler steps
 #: therefore weights quiet passages far more heavily.
 TRAIN_LOSS = "esr"        # "esr" | "mse"
 
+#: Which reference architecture to train. Used for the baseline phase; once you start
+#: inventing, replace build_model() outright and ignore this.
+#:
+#:   a2_standard  11,776 MACs/sample, 12,145 params, rf 6,347   <- the number to beat
+#:   a2_nano       1,731 MACs/sample,  1,870 params, rf 6,347
+#:   a1_standard  13,320 MACs/sample, 13,801 params, rf 4,093   <- more cost, less context
+#:   lstm             51 MACs/sample,     82 params             <- recurrent, tiny
+BASELINE = "a2_standard"
+
 
 # ================================================================================
 # Model
 # ================================================================================
 
 
+_BASELINES = {
+    "a2_standard": a2_standard,
+    "a2_nano": a2_nano,
+    "a1_standard": a1_standard,
+    "lstm": lstm_baseline,
+}
+
+
 def build_model() -> nn.Module:
     """Return a fresh model. **Replace this to change architecture.**
 
-    Must accept ``(batch, samples)`` and return
-    ``(batch, samples - receptive_field + 1)``.
+    Must accept ``(batch, samples)`` and return either
+    ``(batch, samples - receptive_field + 1)`` or ``(batch, samples)`` if the model
+    pads its own start; the harness handles both and drops the warmup region.
     """
-    return a2_standard()
+    try:
+        return _BASELINES[BASELINE]()
+    except KeyError:
+        raise ValueError(
+            f"Unknown BASELINE {BASELINE!r}; expected one of {sorted(_BASELINES)}"
+        ) from None
 
 
 # ================================================================================

@@ -73,16 +73,34 @@ shows steady progress.
 
 ## First runs: baselines, not ideas
 
-Invent nothing until these are logged:
+Invent nothing until the baselines are logged. Set `BASELINE` in `train.py` and run
+each. All four are wired and their costs are
+verified:
 
-1. **A2 standard** — the number to beat.
-2. **A2 nano** — the low-compute reference point (1,731 MACs/sample, 1,870 params).
-3. **A1 standard** — previous generation, for context (13,321 MACs, RF 4,093).
-4. **Noise floor** — A2 standard, 3 seeds.
+| baseline | MACs/sample | params | receptive field |
+|---|---|---|---|
+| `a2_standard` | 11,776 | 12,145 | 6,347 |
+| `a2_nano` | 1,731 | 1,870 | 6,347 |
+| `a1_standard` | 13,320 | 13,801 | 4,093 |
+| `lstm` | 51 | 82 | 1 |
 
-If harness-trained A2 standard does not land within noise of its published ESR on
-these captures, **stop and tell the human**. The harness is wrong, and no result out
-of it means anything until that is fixed.
+Then the **noise floor**: A2 standard, 3 seeds.
+
+Note what A1 vs A2 already tells you — A1 costs *more* (13,320 vs 11,776) for a
+receptive field barely two thirds as long (4,093 vs 6,347). That gap is the size of
+the move A2 made, and roughly the size of the move you are being asked to find again.
+
+**There is no published per-capture A2 ESR to check against.** TONE3000's 39-tone
+evaluation released only MUSHRA listener ratings, and the Slimmable NAM paper's curve
+describes slimmable A1-family models, not A2. So the gate is internal consistency:
+
+1. A2 standard must beat A1 standard, at lower compute.
+2. A2 standard must clearly beat A2 nano.
+3. Costs must match the table above.
+4. ESR must be in a sane absolute range for a converged amp model.
+
+If any of those fail, **stop and tell the human**. The harness is wrong, and no
+result out of it means anything until that is fixed.
 
 ## Output format
 
