@@ -75,8 +75,24 @@ assert len(_A2_KERNEL_SIZES) == len(_A2_DILATIONS) == 23
 #: the WaveNet-level ``head`` must stay ``None``.
 _A2_HEAD_KERNEL_SIZE = 16
 
-#: A2 uses 0.01. Every A1 preset uses 0.02, and training A2 with 0.02 silently drops
-#: it off the fast path with no warning anywhere -- a trap worth knowing about.
+#: Nominal head scale. NOT a universal A2 constant, despite what the C++ detector
+#: implies -- see below. Irrelevant to cost (one elementwise multiply, no effect on
+#: parameters or MACs), so 0.01 is used here purely to match the detector's
+#: definition of "A2 shape".
+#:
+#: In real models this value absorbs A2's -18 dBFS loudness normalization, which is
+#: folded back into the head scale at export. The validated real-world A2 model
+#: ``BossWN-a2.nam`` (mikeoliphant/NeuralAudio, MIT) carries 0.013119162069029721.
+#:
+#: That exposes a genuine inconsistency in the C++ fast path: ``is_a2_shape()``
+#: gates on the JSON ``head_scale`` being within 1e-7 of 0.01
+#: (``a2_fast.cpp:778-782``), but ``_load_weights`` then overrides ``_head_scale``
+#: from the trailing value in the weight stream anyway (``a2_fast.cpp:264-265``).
+#: So the field is load-bearing for *detection* while being ignored for *computation*
+#: -- and a real A2 model whose loudness normalization moved head_scale off 0.01 is
+#: silently rejected by the specialization built for it, falling back to the generic
+#: WaveNet with no warning. Verified against BossWN-a2; whether it holds across a
+#: corpus of A2 models has not been checked.
 _A2_HEAD_SCALE = 0.01
 
 _A2_LEAKY_SLOPE = 0.01

@@ -201,8 +201,17 @@ weighting, augmentation, longer effective context, initialization, weight EMA.
 
 ### Quantization-aware training
 
-The A2 story is "runs on a $3 chip". A model trained int8-aware may beat a float
-model that has to be quantized after the fact.
+A model trained int8-aware may beat a float model quantized after the fact, and low
+precision is one of the few levers that reduces real cost rather than just MAC count.
+
+Two caveats worth knowing before spending a night on this. First, the "A2 runs on a
+$3 Cortex-M7" figure is **unverified vendor marketing** — it appears once in the
+modulus research trail, flagged as corroboration to be re-measured, and never was. No
+ARM measurement exists in either codebase. Do not treat it as a target you are
+hitting or missing. Second, quantization breaks bit-parity against the C++ reference,
+which is a hard product constraint for an inference runtime but *not* a constraint on
+this search — just be aware that a quantized win here cannot be validated by the
+existing parity gates and needs its own tolerance regime.
 
 ## Reading
 
