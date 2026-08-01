@@ -1,0 +1,103 @@
+{
+  "profile": "devcontainer-4cpu",
+  "machine": "autoresearch dev container, 4 vCPU, shared/virtualized",
+  "tool": "modulus nam_diag, block 64, sr 48000, --repeats 4, median of 3 invocations",
+  "measurements": [
+    {
+      "name": "a2_full",
+      "features": {
+        "macs": 10624.0,
+        "elementwise": 729.0,
+        "conv_ops": 71.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 5.096875,
+      "n_repeats": 3,
+      "spread_rel": 0.0159
+    },
+    {
+      "name": "a2_lite",
+      "features": {
+        "macs": 1569.0,
+        "elementwise": 274.0,
+        "conv_ops": 71.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 1.715625,
+      "n_repeats": 3,
+      "spread_rel": 0.0546
+    },
+    {
+      "name": "deep_narrow",
+      "features": {
+        "macs": 3087.0,
+        "elementwise": 550.0,
+        "conv_ops": 140.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 3.590625,
+      "n_repeats": 3,
+      "spread_rel": 0.0352
+    },
+    {
+      "name": "very_deep_narrow",
+      "features": {
+        "macs": 1414.0,
+        "elementwise": 367.0,
+        "conv_ops": 140.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 2.68125,
+      "n_repeats": 3,
+      "spread_rel": 0.1364
+    },
+    {
+      "name": "shallow_wide",
+      "features": {
+        "macs": 21968.0,
+        "elementwise": 753.0,
+        "conv_ops": 38.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 8.2859375,
+      "n_repeats": 3,
+      "spread_rel": 0.0466
+    },
+    {
+      "name": "shallow_narrow",
+      "features": {
+        "macs": 3784.0,
+        "elementwise": 249.0,
+        "conv_ops": 26.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 1.890625,
+      "n_repeats": 3,
+      "spread_rel": 0.1298
+    },
+    {
+      "name": "mid",
+      "features": {
+        "macs": 4225.0,
+        "elementwise": 456.0,
+        "conv_ops": 71.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 2.99375,
+      "n_repeats": 3,
+      "spread_rel": 0.0861
+    },
+    {
+      "name": "deep_wide",
+      "features": {
+        "macs": 8874.0,
+        "elementwise": 811.0,
+        "conv_ops": 104.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 5.9125,
+      "n_repeats": 3,
+      "spread_rel": 0.0661
+    }
+  ]
+}

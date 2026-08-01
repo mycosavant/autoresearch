@@ -1,389 +1,282 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time data preparation. READ-ONLY: not to be modified by the research agent.
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+Ingests dry/wet capture pairs, aligns and normalizes them, and writes the panel
+manifest that every experiment then loads identically.
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Alignment is the part that earns its keep. A capture pair recorded through a
+reamping loop carries an unknown latency of anywhere from a handful to a few hundred
+samples. A few samples of misalignment inflates ESR by orders of magnitude, and it
+does so in a way that is indistinguishable from a bad architecture -- an entire
+night's search can be spent chasing a delay. So the delay is estimated once per
+capture by cross-correlation, frozen into the manifest, and applied identically on
+every load.
+
+Usage
+-----
+    uv run prepare.py --sources sources.json
+
+``sources.json`` describes where the captures live::
+
+    {
+      "panel": [
+        {"name": "fender_deluxe_clean", "category": "clean",
+         "input": "/data/fender/input.wav", "target": "/data/fender/target.wav"}
+      ],
+      "holdout": [...]
+    }
+
+Paths may be local files or ``http(s)://`` URLs.
 """
 
-import os
-import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
+from __future__ import annotations
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import argparse as _argparse
+import json as _json
+import shutil as _shutil
+import sys as _sys
+import urllib.request as _urlreq
+from pathlib import Path as _Path
+from typing import Dict, List, Optional, Tuple
 
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
+import numpy as _np
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+from harness.constants import DATA_DIR, MANIFEST_PATH, SAMPLE_RATE
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+#: Maximum dry/wet latency searched, in samples. 4096 @ 48 kHz is ~85 ms, which
+#: comfortably covers reamping interfaces, converter latency and plugin delay
+#: compensation errors.
+MAX_DELAY_SEARCH = 4096
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+#: Seconds used for delay estimation. A short window keeps the correlation cheap;
+#: taking it from the middle avoids fade-ins and leading silence, which correlate
+#: poorly and give unstable estimates.
+DELAY_ESTIMATE_SECONDS = 20.0
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+#: Target RMS level in dBFS. NAM normalizes to a -18 dBFS reference, and A2
+#: additionally folds that rescale back into its head scale; the C++ loader applies
+#: ``gain = 10^((-18 - metadata.loudness) / 20)`` post-inference for both A1 and A2.
+#: Matching it here keeps this harness's data conditioning consistent with the
+#: models it is trying to beat. RMS rather than peak: a high-gain capture is heavily
+#: compressed, so peak-normalizing it lands the *body* of the signal far quieter than
+#: a clean capture normalized the same way, which would silently make the panel's
+#: categories operate at different points on their nonlinearities.
+TARGET_RMS_DBFS = -18.0
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+#: Ceiling applied after RMS normalization. A -18 dBFS RMS crest can still exceed
+#: full scale on a clean capture, and clipping the reference signal would corrupt the
+#: target the model is being asked to fit.
+PEAK_CEILING = 0.99
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def estimate_delay(x: _np.ndarray, y: _np.ndarray, max_delay: int = MAX_DELAY_SEARCH) -> int:
+    """Estimate how many samples ``y`` lags behind ``x``, by cross-correlation.
+
+    Positive result means the wet signal is late, which is the normal case.
+
+    Uses an FFT cross-correlation over a mid-signal excerpt. Both signals are
+    mean-removed and energy-normalized first, so the estimate depends on waveform
+    shape rather than on the amplifier's gain -- which matters, because a high-gain
+    capture can be 30 dB louder than its input.
+    """
+    n = int(min(len(x), len(y), DELAY_ESTIMATE_SECONDS * SAMPLE_RATE))
+    if n <= max_delay * 2:
+        raise ValueError(f"Capture too short ({n} samples) to estimate delay reliably.")
+
+    mid = min(len(x), len(y)) // 2
+    start = max(0, mid - n // 2)
+    a = x[start:start + n].astype(_np.float64)
+    b = y[start:start + n].astype(_np.float64)
+
+    a -= a.mean()
+    b -= b.mean()
+    a_norm, b_norm = _np.linalg.norm(a), _np.linalg.norm(b)
+    if a_norm == 0 or b_norm == 0:
+        raise ValueError("Silent segment; cannot estimate delay.")
+    a /= a_norm
+    b /= b_norm
+
+    size = 1 << int(_np.ceil(_np.log2(n + max_delay)) + 1)
+    corr = _np.fft.irfft(_np.fft.rfft(b, size) * _np.conj(_np.fft.rfft(a, size)), size)
+
+    # Only non-negative lags: the wet signal cannot precede the dry one.
+    lags = corr[: max_delay + 1]
+    return int(_np.argmax(_np.abs(lags)))
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def _fetch(src: str, dest: _Path, cache: Optional[_Path] = None) -> _Path:
+    """Copy or download ``src`` to ``dest``.
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+    Accepts a local path, an ``http(s)`` URL, or ``<zip-url>#<path/inside.zip>``.
+    The zip form exists because the ToneTwist records are distributed as one archive
+    per device; downloading a 1.6 GB zip once and pulling two files out of it beats
+    asking every user to unpack by hand.
+    """
+    if "#" in src and src.startswith(("http://", "https://")):
+        archive_url, inner = src.split("#", 1)
+        archive = _download_cached(archive_url, cache or dest.parent)
+        import zipfile
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+        with zipfile.ZipFile(archive) as zf:
+            try:
+                member = zf.getinfo(inner)
+            except KeyError:
+                candidates = [n for n in zf.namelist() if n.endswith(inner)]
+                if len(candidates) != 1:
+                    raise FileNotFoundError(
+                        f"{inner!r} not found in {archive_url} "
+                        f"({len(candidates)} fuzzy matches)"
+                    )
+                member = zf.getinfo(candidates[0])
+            with zf.open(member) as fh, dest.open("wb") as out:
+                _shutil.copyfileobj(fh, out)
+        return dest
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+    if src.startswith(("http://", "https://")):
+        _log(f"    downloading {src}")
+        with _urlreq.urlopen(src) as response, dest.open("wb") as fh:
+            _shutil.copyfileobj(response, fh)
+        return dest
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+    source = _Path(src).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"Capture file not found: {source}")
+    _shutil.copyfile(source, dest)
+    return dest
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+def _download_cached(url: str, cache_dir: _Path) -> _Path:
+    """Download ``url`` once and reuse it. Archives here are up to ~3 GB."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    name = url.rstrip("/").split("/")[-1].split("?")[0] or "archive.zip"
+    path = cache_dir / f"_cache_{name}"
+    if path.is_file():
+        return path
+    _log(f"    downloading archive {url}")
+    tmp = path.with_suffix(path.suffix + ".part")
+    with _urlreq.urlopen(url) as response, tmp.open("wb") as fh:
+        _shutil.copyfileobj(response, fh)
+    tmp.rename(path)
+    return path
+
+
+def _load_and_normalize(path: _Path) -> _np.ndarray:
+    from nam.data import wav_to_np
+
+    x = wav_to_np(path, rate=SAMPLE_RATE)
+    x = _np.asarray(x, dtype=_np.float32).reshape(-1)
+    peak = float(_np.abs(x).max())
+    if peak == 0.0:
+        raise ValueError(f"{path} is silent.")
+    return x
+
+
+def _normalize_rms(z: _np.ndarray, target_dbfs: float = TARGET_RMS_DBFS) -> _np.ndarray:
+    """Scale ``z`` to ``target_dbfs`` RMS, backing off if that would clip."""
+    rms = float(_np.sqrt(_np.mean(_np.square(z.astype(_np.float64)))))
+    if rms == 0.0:
+        raise ValueError("Silent signal; cannot normalize.")
+
+    gain = 10.0 ** (target_dbfs / 20.0) / rms
+    peak = float(_np.abs(z).max()) * gain
+    if peak > PEAK_CEILING:
+        gain *= PEAK_CEILING / peak
+    return (z * gain).astype(_np.float32)
+
+
+def _prepare_entry(entry: Dict, out_dir: _Path) -> Dict:
+    from nam.data import np_to_wav
+
+    name = entry["name"]
+    _log(f"  {name}")
+    dest = out_dir / name
+    dest.mkdir(parents=True, exist_ok=True)
+
+    raw_in = _fetch(entry["input"], dest / "_raw_input.wav")
+    raw_out = _fetch(entry["target"], dest / "_raw_target.wav")
+
+    x = _load_and_normalize(raw_in)
+    y = _load_and_normalize(raw_out)
+
+    delay = estimate_delay(x, y)
+    _log(f"    delay={delay} samples ({1000 * delay / SAMPLE_RATE:.2f} ms)")
+
+    # Normalize levels *after* alignment, to NAM's -18 dBFS RMS reference.
+    x = _normalize_rms(x)
+    y = _normalize_rms(y)
+
+    np_to_wav(x, dest / "input.wav", rate=SAMPLE_RATE)
+    np_to_wav(y, dest / "target.wav", rate=SAMPLE_RATE)
+    raw_in.unlink(missing_ok=True)
+    raw_out.unlink(missing_ok=True)
+
+    seconds = len(x) / SAMPLE_RATE
+    _log(f"    {seconds:.1f}s @ {SAMPLE_RATE} Hz")
+
+    return {
+        "name": name,
+        "category": entry.get("category", "unknown"),
+        "dir": name,
+        "input": "input.wav",
+        "target": "target.wav",
+        "delay": delay,
+        "seconds": round(seconds, 2),
+        "source": {"input": entry["input"], "target": entry["target"]},
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = _argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--sources",
+        type=_Path,
+        default=_Path("sources.json"),
+        help="JSON describing the capture panel and holdout.",
     )
+    parser.add_argument("--data-dir", type=_Path, default=DATA_DIR)
+    parser.add_argument("--manifest", type=_Path, default=MANIFEST_PATH)
+    args = parser.parse_args(argv)
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    if not args.sources.is_file():
+        _log(
+            f"No sources file at {args.sources}.\n\n"
+            "Create one describing your captures, e.g.:\n\n"
+            '{\n'
+            '  "panel": [\n'
+            '    {"name": "fender_deluxe_clean", "category": "clean",\n'
+            '     "input": "/data/fender/input.wav",\n'
+            '     "target": "/data/fender/target.wav"}\n'
+            '  ],\n'
+            '  "holdout": []\n'
+            "}\n\n"
+            "See docs/DATA.md for the recommended panel."
+        )
+        return 1
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    sources = _json.loads(args.sources.read_text())
+    args.data_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    manifest: Dict[str, object] = {"sample_rate": SAMPLE_RATE}
+    for split in ("panel", "holdout"):
+        entries = sources.get(split, [])
+        if entries:
+            _log(f"{split}:")
+        manifest[split] = [_prepare_entry(e, args.data_dir) for e in entries]
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    if not manifest["panel"]:
+        _log("ERROR: the panel is empty; at least one capture is required.")
+        return 1
 
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
+    args.manifest.parent.mkdir(parents=True, exist_ok=True)
+    args.manifest.write_text(_json.dumps(manifest, indent=2))
+    _log(f"\nwrote {args.manifest}")
+    _log(f"panel={len(manifest['panel'])} holdout={len(manifest['holdout'])}")
+    return 0
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    _sys.exit(main())
