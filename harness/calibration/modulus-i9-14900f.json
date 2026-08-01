@@ -1,0 +1,28 @@
+{
+  "profile": "modulus-i9-14900f",
+  "machine": "i9-14900F, modulus Rust inference-nam, release",
+  "tool": "published in modulus .claude/research/2026-06-06-nam-a2-perf-baseline.md",
+  "caveat": "DEGENERATE: both points are 23 layers / 71 convolutions, so conv_ops does not vary and its coefficient is unidentifiable. Retained for provenance; not adequate to gate on.",
+  "measurements": [
+    {
+      "name": "a2_full_8ch",
+      "features": {
+        "macs": 11776.0,
+        "elementwise": 729.0,
+        "conv_ops": 71.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 3.15625
+    },
+    {
+      "name": "a2_lite_3ch",
+      "features": {
+        "macs": 1731.0,
+        "elementwise": 274.0,
+        "conv_ops": 71.0,
+        "const": 1.0
+      },
+      "microseconds_per_sample": 0.859375
+    }
+  ]
+}

@@ -9,11 +9,15 @@ import pytest
 from harness.cost import CostReport
 from harness.cost_model import (
     DEFAULT_MODEL,
-    MODULUS_MEASUREMENTS,
     Measurement,
+    available_profiles,
     features_of,
     fit,
+    load_profile,
 )
+
+DEGENERATE = load_profile("modulus-i9-14900f")
+CALIBRATED = load_profile("devcontainer-4cpu")
 from harness.verdict import Budget, check_budget
 
 
@@ -29,26 +33,56 @@ def _report(macs=11776.0, elementwise=729.0, conv_ops=71):
     )
 
 
-def test_default_model_reproduces_its_calibration_points():
-    for m in MODULUS_MEASUREMENTS:
-        assert DEFAULT_MODEL.predict(m.features) == pytest.approx(
-            m.microseconds_per_sample, rel=1e-6
-        )
+def test_profiles_are_discoverable():
+    assert {"devcontainer-4cpu", "modulus-i9-14900f"} <= set(available_profiles())
 
 
-def test_default_model_reproduces_published_realtime_factors():
-    """modulus published 6.6x (Full) and 24.2x (Lite) real-time."""
-    by_name = {m.name: m for m in MODULUS_MEASUREMENTS}
-    xrt = lambda m: 1e6 / 48000.0 / DEFAULT_MODEL.predict(m.features)  # noqa: E731
-    assert xrt(by_name["a2_full_8ch"]) == pytest.approx(6.6, abs=0.1)
-    assert xrt(by_name["a2_lite_3ch"]) == pytest.approx(24.2, abs=0.1)
+def test_unknown_profile_raises_with_guidance():
+    with pytest.raises(FileNotFoundError, match="tools/calibrate.py"):
+        load_profile("no-such-machine")
 
 
-def test_default_model_knows_it_is_not_adequate():
+def test_degenerate_profile_knows_it_is_not_adequate():
     """Two structurally identical points cannot identify a per-layer term."""
+    assert not DEGENERATE.is_adequate
+    assert "conv_ops" not in DEGENERATE.identifiable
+    assert any("constant across all measurements" in n for n in DEGENERATE.notes)
+
+
+def test_degenerate_profile_still_reproduces_published_realtime_factors():
+    """modulus published 6.6x (Full) and 24.2x (Lite). Interpolation, not evidence."""
+    xrt = lambda f: 1e6 / 48000.0 / DEGENERATE.predict(f)  # noqa: E731
+    full = {"macs": 11776.0, "elementwise": 729.0, "conv_ops": 71.0, "const": 1.0}
+    lite = {"macs": 1731.0, "elementwise": 274.0, "conv_ops": 71.0, "const": 1.0}
+    assert xrt(full) == pytest.approx(6.6, abs=0.1)
+    assert xrt(lite) == pytest.approx(24.2, abs=0.1)
+
+
+def test_measured_profile_is_adequate_and_identified():
+    """Eight architectures spanning depth and width identify every coefficient."""
+    assert CALIBRATED.is_adequate
+    assert CALIBRATED.identifiable == {"macs", "elementwise", "conv_ops", "const"}
+    # Residual should sit within the measurement spread (3-9% observed).
+    assert CALIBRATED.residual_rel_error < 0.10
+
+
+def test_measured_profile_charges_for_depth():
+    """The whole point: equal MACs, different depth, materially different cost.
+
+    On the measured profile a 26 -> 140 convolution increase at fixed arithmetic
+    costs ~1.49x. A MAC-only model scores these two identically, which is the bias
+    this whole module exists to remove.
+    """
+    shallow = {"macs": 5000.0, "elementwise": 300.0, "conv_ops": 26.0, "const": 1.0}
+    deep = {"macs": 5000.0, "elementwise": 300.0, "conv_ops": 140.0, "const": 1.0}
+    assert CALIBRATED.predict(deep) / CALIBRATED.predict(shallow) == pytest.approx(1.49, abs=0.1)
+
+
+def test_unset_profile_is_uncalibrated_and_does_not_gate():
+    """Default ships uncalibrated: another machine's coefficients are not applied."""
     assert not DEFAULT_MODEL.is_adequate
-    assert "conv_ops" not in DEFAULT_MODEL.identifiable
-    assert any("constant across all measurements" in n for n in DEFAULT_MODEL.notes)
+    assert DEFAULT_MODEL.n_measurements == 0
+    assert any("No calibration profile selected" in n for n in DEFAULT_MODEL.notes)
 
 
 def test_constant_feature_is_reported_unidentifiable():
@@ -76,6 +110,10 @@ def test_varying_depth_makes_conv_ops_identifiable():
     assert model.identifiable == {"macs", "elementwise", "conv_ops", "const"}
     for key, expected in truth.items():
         assert model.coefficients[key] == pytest.approx(expected, rel=1e-6)
+
+
+def test_uncalibrated_model_predicts_zero_rather_than_guessing():
+    assert DEFAULT_MODEL.predict(features_of(_report())) == 0.0
 
 
 def test_features_extracted_from_cost_report():

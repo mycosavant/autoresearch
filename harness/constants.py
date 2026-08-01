@@ -92,3 +92,10 @@ RESULTS_COLUMNS = (
     "status",         # keep | discard | crash | invalid
     "description",
 )
+
+#: Active cost-model calibration profile (see harness/calibration/).
+#: Coefficients are machine-specific and do not transfer, so this is left unset by
+#: default: an unset profile means predictions are unavailable and the runtime cap
+#: does not gate, rather than silently applying some other machine's numbers.
+#: Run tools/calibrate.py on the research box to produce its profile.
+CALIBRATION_PROFILE = ""

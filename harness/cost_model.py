@@ -21,19 +21,32 @@ least squares with an explicit rank and conditioning check: any coefficient that
 available measurements cannot separate is reported as **unidentifiable** rather than
 handed back as a number that happens to minimise residuals.
 
-This matters immediately. The two shipped calibration points (A2 Full and A2 Lite)
-have *identical structure* -- both are 23 layers and 71 convolutions -- and differ
-only in width. They therefore cannot distinguish a per-convolution overhead term from
-a constant per-call term. Getting a real per-layer coefficient needs measurements at
-differing depths; see :func:`fit` and ``docs/CALIBRATION.md``.
+This matters concretely. The ``modulus-i9-14900f`` profile has two points of
+*identical structure* -- both 23 layers and 71 convolutions -- differing only in
+width, so it cannot separate a per-convolution overhead term from a constant. It
+reports itself unidentifiable rather than returning coefficients that merely fit.
+The ``devcontainer-4cpu`` profile shows the fix: eight architectures spanning
+26-140 convolutions and 1.4k-22k MACs, which identifies all four coefficients.
 
-Until then :data:`DEFAULT_MODEL` reports ``is_adequate == False``, and the runner
-treats its prediction as advisory rather than as a gate.
+Calibration is per-machine
+--------------------------
+Coefficients do not transfer between machines -- they encode a specific CPU's
+arithmetic throughput and per-call overhead. So calibrations are stored as named
+*profiles* under ``harness/calibration/``, and the active one is chosen explicitly by
+:data:`~harness.constants.CALIBRATION_PROFILE`.
+
+If no profile is selected, the model is uncalibrated: predictions are unavailable and
+nothing gates. That is deliberate. Silently applying another machine's coefficients
+would produce confident, wrong numbers -- worse than no model at all.
+
+Run ``tools/calibrate.py`` on a new machine to produce its profile.
 """
 
 from __future__ import annotations
 
+import json as _json
 from dataclasses import dataclass as _dataclass, field as _field
+from pathlib import Path as _Path
 from typing import Dict, List, Mapping, Sequence, Set
 
 import numpy as _np
@@ -46,8 +59,11 @@ __all__ = [
     "CostModel",
     "features_of",
     "fit",
+    "load_profile",
+    "available_profiles",
+    "active_model",
     "DEFAULT_MODEL",
-    "MODULUS_MEASUREMENTS",
+    "CALIBRATION_DIR",
 ]
 
 #: Structural features the runtime is modelled against. ``const`` is the intercept:
@@ -192,35 +208,75 @@ def fit(measurements: Sequence[Measurement], provenance: str = "") -> CostModel:
 
 
 # --------------------------------------------------------------------------------
-# Shipped calibration.
-#
-# Source: modulus `.claude/research/2026-06-06-nam-a2-perf-baseline.md` and
-# `crates/inference-nam/CLAUDE.md`, measured on an i9-14900F, release build, block
-# size 64, `process()`-only mean, after the frame-axis vectorization work.
-# Converted from microseconds-per-64-sample-block to microseconds-per-sample.
-#
-# Both points are 23 layers / 71 convolutions, so `conv_ops` does not vary and its
-# coefficient is not identifiable from them. This is deliberately left visible.
+# Profiles
 # --------------------------------------------------------------------------------
 
-_BLOCK = 64.0
+CALIBRATION_DIR = _Path(__file__).resolve().parent / "calibration"
 
-MODULUS_MEASUREMENTS: List[Measurement] = [
-    Measurement(
-        name="a2_full_8ch",
-        features={"macs": 11776.0, "elementwise": 729.0, "conv_ops": 71.0, "const": 1.0},
-        microseconds_per_sample=202.0 / _BLOCK,
-        provenance="modulus Rust inference-nam, i9-14900F, block 64",
-    ),
-    Measurement(
-        name="a2_lite_3ch",
-        features={"macs": 1731.0, "elementwise": 274.0, "conv_ops": 71.0, "const": 1.0},
-        microseconds_per_sample=55.0 / _BLOCK,
-        provenance="modulus Rust inference-nam, i9-14900F, block 64",
-    ),
-]
 
-DEFAULT_MODEL = fit(
-    MODULUS_MEASUREMENTS,
-    provenance="modulus A2 perf baseline (i9-14900F, block 64, Rust)",
-)
+def available_profiles() -> List[str]:
+    """Names of calibration profiles present on disk."""
+    if not CALIBRATION_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in CALIBRATION_DIR.glob("*.json"))
+
+
+def load_profile(name: str) -> CostModel:
+    """Load and fit a named calibration profile."""
+    path = CALIBRATION_DIR / f"{name}.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"No calibration profile {name!r} in {CALIBRATION_DIR}. "
+            f"Available: {available_profiles() or 'none'}. "
+            f"Run tools/calibrate.py to create one for this machine."
+        )
+    data = _json.loads(path.read_text())
+    measurements = [
+        Measurement(
+            name=m["name"],
+            features=m["features"],
+            microseconds_per_sample=float(m["microseconds_per_sample"]),
+            provenance=data.get("tool", ""),
+        )
+        for m in data["measurements"]
+    ]
+    model = fit(measurements, provenance=f"{data.get('profile', name)}: {data.get('machine', '')}")
+    if data.get("caveat"):
+        model.notes.append(data["caveat"])
+    return model
+
+
+def _uncalibrated() -> CostModel:
+    """A model that knows it has no calibration, and therefore predicts nothing."""
+    return CostModel(
+        coefficients={f: 0.0 for f in FEATURES},
+        identifiable=set(),
+        n_measurements=0,
+        condition_number=float("inf"),
+        residual_rel_error=float("inf"),
+        provenance="uncalibrated",
+        notes=[
+            "No calibration profile selected. Set CALIBRATION_PROFILE in "
+            "harness/constants.py to one of "
+            f"{available_profiles() or ['(none available)']}, or run tools/calibrate.py "
+            "to measure this machine. Predictions are unavailable and the "
+            "runtime cap does not gate; only the MAC and elementwise caps bind."
+        ],
+    )
+
+
+def active_model() -> CostModel:
+    """The calibration for this machine, or an uncalibrated model if none is set."""
+    from .constants import CALIBRATION_PROFILE
+
+    if not CALIBRATION_PROFILE:
+        return _uncalibrated()
+    try:
+        return load_profile(CALIBRATION_PROFILE)
+    except FileNotFoundError as e:  # pragma: no cover - configuration error
+        model = _uncalibrated()
+        model.notes.append(str(e))
+        return model
+
+
+DEFAULT_MODEL = active_model()
