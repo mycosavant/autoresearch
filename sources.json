@@ -1,0 +1,68 @@
+{
+  "_notes": [
+    "Capture sources for `uv run prepare.py`. See docs/DATA.md for provenance,",
+    "licensing and known gotchas before using any of this in published work.",
+    "",
+    "Panel slots 1-3 are the exact captures from the Slimmable NAM paper",
+    "(arXiv 2511.07470), which means harness ESR can be compared directly against",
+    "Atkinson's published curve. Slot 4 is a pedal, which the A2 set lacks.",
+    "",
+    "LICENSING: the A2 captures carry no stated license (code is MIT; the audio",
+    "Drive folder has no license file). ToneTwist is CC-BY-NC-4.0 -- NonCommercial.",
+    "Fine for research; check before shipping anything commercial."
+  ],
+
+  "panel": [
+    {
+      "name": "fender_deluxe_reverb_clean",
+      "category": "clean",
+      "input": "https://drive.usercontent.google.com/download?id=1y7K3Ky_PXoh0gX7Uiez-ezJyWVUJClLC&export=download",
+      "target": "https://drive.usercontent.google.com/download?id=1yoCZgtIe1TifRsmTkEEYZQpKA2mZ_B2b&export=download"
+    },
+    {
+      "name": "morgan_mvp23_crunch",
+      "category": "crunch",
+      "input": "https://drive.usercontent.google.com/download?id=1y7K3Ky_PXoh0gX7Uiez-ezJyWVUJClLC&export=download",
+      "target": "https://drive.usercontent.google.com/download?id=1RVgeR62B99cZLXlzrpfvsvFLSpe6-N_Q&export=download"
+    },
+    {
+      "name": "omega_obsidian_rhythm",
+      "category": "high-gain",
+      "input": "https://drive.usercontent.google.com/download?id=1y7K3Ky_PXoh0gX7Uiez-ezJyWVUJClLC&export=download",
+      "target": "https://drive.usercontent.google.com/download?id=1uXpQqkSN-KQDXeMeP3vHOMRUUEhsYHzB&export=download"
+    },
+    {
+      "name": "fulltone_full_drive_2",
+      "category": "pedal",
+      "input": "https://zenodo.org/records/10455730/files/DRY-with-markers.zip?download=1#DRY-with-markers/trainval/nam.input.wav",
+      "target": "https://zenodo.org/records/10794615/files/FullDrive2.zip?download=1#V100_T050_O050_B000.nam.target.wav"
+    }
+  ],
+
+  "holdout": [
+    {
+      "name": "omega_obsidian_lead",
+      "category": "high-gain",
+      "input": "https://drive.usercontent.google.com/download?id=1y7K3Ky_PXoh0gX7Uiez-ezJyWVUJClLC&export=download",
+      "target": "https://drive.usercontent.google.com/download?id=1BWh2Ql5ROSDYsp3RqC_xthiq9r1GRavj&export=download"
+    },
+    {
+      "name": "blackstar_ht1_overdrive",
+      "category": "crunch",
+      "input": "https://zenodo.org/records/10794425/files/BlackstarHT1.zip?download=1#DRY/trainval/input.wav",
+      "target": "https://zenodo.org/records/10794425/files/BlackstarHT1.zip?download=1#trainval/target.wav"
+    },
+    {
+      "name": "mesa_mark_v_extreme",
+      "category": "high-gain",
+      "input": "https://zenodo.org/records/10796864/files/MesaMarkV-Extreme.zip?download=1#DRY/trainval/input.wav",
+      "target": "https://zenodo.org/records/10796864/files/MesaMarkV-Extreme.zip?download=1#trainval/target.wav"
+    },
+    {
+      "name": "ehx_big_muff",
+      "category": "fuzz",
+      "input": "https://zenodo.org/records/10891515/files/BigMuff.zip?download=1#DRY/trainval/input.wav",
+      "target": "https://zenodo.org/records/10891515/files/BigMuff.zip?download=1#trainval/target.wav"
+    }
+  ]
+}
