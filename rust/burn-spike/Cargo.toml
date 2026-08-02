@@ -1,0 +1,13 @@
+[package]
+name = "burn-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+
+[features]
+default = []
+# Compiled but unverified here: this container has no GPU. See README.
+cuda = ["burn/cuda"]

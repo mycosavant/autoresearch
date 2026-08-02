@@ -27,3 +27,6 @@ runs/
 
 # Dev-only venv (this container; not part of the project)
 .venv-dev/
+
+# Rust build artifacts
+rust/**/target/
