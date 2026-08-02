@@ -73,7 +73,7 @@ Slimmable paper's curve is not an A2 curve.
 So the gate has to be an *internal* consistency check instead:
 
 1. **A2 must beat A1 standard** on the same captures at lower compute (11,776 vs
-   13,321 MACs/sample). That is A2's whole claim; if the harness cannot reproduce a
+   13,320 MACs/sample). That is A2's whole claim; if the harness cannot reproduce a
    result that lopsided, the harness is wrong.
 2. **A2 standard must beat A2 nano** by a clear margin (11,776 vs 1,731 MACs/sample).
 3. **Cost figures must match** the three independent derivations that already agree:

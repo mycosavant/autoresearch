@@ -85,6 +85,9 @@ uv run prepare.py --sources sources.json # fetch + align captures (one-time)
 uv run train.py                          # one experiment
 ```
 
+For the first session on a new box, follow `docs/BASELINES.md` instead — the loop
+cannot make a keep/discard decision until an incumbent and a noise floor exist.
+
 Then point an agent at the repo:
 
 ```
@@ -101,7 +104,8 @@ training box.
 ## Baselines first
 
 The loop establishes A2 standard, A2 nano, A1 standard, and the noise floor before
-inventing anything.
+inventing anything. **`docs/BASELINES.md` is the runbook** — the exact command
+sequence, about two hours end to end.
 
 There is **no published per-capture A2 ESR figure to check against** — TONE3000
 released only MUSHRA listener ratings from its 39-tone evaluation, and the Slimmable

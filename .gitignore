@@ -22,5 +22,8 @@ dev/
 # Results file
 results.tsv
 
+# Run logs (docs/BASELINES.md writes these)
+runs/
+
 # Dev-only venv (this container; not part of the project)
 .venv-dev/
